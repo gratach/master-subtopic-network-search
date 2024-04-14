@@ -1,6 +1,7 @@
 from sqlite3 import connect
 from openai import OpenAI
 from json import loads
+import os
 
 llmClient = OpenAI()
 llmModel = "gpt-3.5-turbo"
@@ -17,8 +18,18 @@ def chat(query, seed = llmSeed):
         ]
     )
     return answer.choices[0].message.content
+blabladorClient = OpenAI(base_url="https://helmholtz-blablador.fz-juelich.de:8000/v1/", api_key=os.environ["BLABLADOR_API_KEY"])
+blabladorModel = "1 - Mistral-7B-Instruct-v0.2 the best option in general - fast and good"
+def blablador(query, seed = llmSeed):
+    answer = blabladorClient.completions.create(model=blabladorModel, prompt=f"USER: {query} SYSTEM: ", max_tokens=500, seed=seed)
+    return answer.choices[0].text
 
-con = connect("subtopic-network-search.sqlite")
+subtopicNetworkCompletion = blablador
+searchCompletion = chat
+
+nameOfTheDataCollection = "mistral"
+
+con = connect(f"{nameOfTheDataCollection}-evaluation.sqlite")
 cur = con.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY, topic TEXT UNIQUE, subtopicsGenerated BOOLEAN)")
 cur.execute("CREATE TABLE IF NOT EXISTS subtopics (id INTEGER PRIMARY KEY, topic_id INTEGER, subtopic_id INTEGER)")
@@ -45,14 +56,23 @@ def ensureSubtopics(topicId):
         return
     cur.execute("SELECT topic FROM topics WHERE id=?", (topicId,))
     topic = cur.fetchone()[0]
-    answer = chat(f'What are the subtopics of topic "{topic}" that together cover the entire range of the topic area? Return nothing but the list of subtopics formatted as json array: ["subtopic1", "subtopic2", ...]')
-    try:
-        subtopics = loads(answer)
-        assert type(subtopics) == list
-        for subtopic in subtopics:
-            assert type(subtopic) == str
-    except:
-        print("Error: The answer is not a valid json array")
+    tryNumber = 0
+    maxTries = 10
+    subtopicsLoaded = False
+    while not subtopicsLoaded and tryNumber < maxTries:
+        answer = subtopicNetworkCompletion(f'What are the subtopics of topic "{topic}" that together cover the entire range of the topic area? Return nothing but the list of subtopics formatted as json array: ["subtopic1", "subtopic2", ...]',
+                                           seed = llmSeed + tryNumber)
+        try:
+            subtopics = loads(answer)
+            assert type(subtopics) == list
+            for subtopic in subtopics:
+                assert type(subtopic) == str
+            subtopicsLoaded = True
+        except:
+            pass
+        tryNumber += 1
+    if not subtopicsLoaded:
+        print(f"Failed to load subtopics for topic {topic}")
         return
     for subtopic in subtopics:
         subtopic = subtopic.strip().lower()
@@ -96,12 +116,22 @@ def searchKeyword(keyword, maxDepth=10):
             break
         subtopicNames = [getTopicFromId(x) for x in subtopics]
         subtopicNameSelection = "{" + ", ".join([f'{i} : "{x}"' for i, x in enumerate(subtopicNames)]) + "}"
-        answer = chat(f'Which of the following topics {subtopicNameSelection} is most likely to contain the keyword "{keyword}"? Return only the number without description.')
-        try:
-            index = int(answer)
-            assert 0 <= index < len(subtopics)
-        except:
+        subtopicChosen = False
+        maxTries = 10
+        tryNumber = 0
+        while not subtopicChosen and tryNumber < maxTries:
+            answer = searchCompletion(f'Which of the following topics {subtopicNameSelection} is most likely to contain the keyword "{keyword}"? Return only the number without description.',
+                                        seed = llmSeed + tryNumber)
+            try:
+                index = int(answer)
+                assert 0 <= index < len(subtopics)
+                subtopicChosen = True
+            except:
+                pass
+            tryNumber += 1
+        if not subtopicChosen:
             failed = True
+            print(f"Failed to choose subtopic for keyword {keyword}")
             break
         searchpath.append(subtopics[index])
         # Check if the keyword is equivalent to the chosen subtopic
@@ -131,13 +161,56 @@ def exportAllSearchPaths():
     Export all search paths to a file
     """
     cur.execute("SELECT keyword, searchpath, found, failed FROM keywordSearch")
-    with open("searchpaths.txt", "w") as file:
+    with open(f"{nameOfTheDataCollection}-searchpaths.txt", "w") as file:
         for keyword, searchpath, found, failed in cur.fetchall():
             searchpath = [getTopicFromId(int(x)) for x in searchpath.split(",")]
             file.write(f"{keyword}: {searchpath}\n")
+
+def navigateSubtopicNetwork():
+    """
+    Navigate the subtopic network
+    """
+    currentTopicId = rootTopicId
+    while True:
+        print(f"{getTopicFromId(currentTopicId)} (id: {currentTopicId})")
+        # Print all super topics
+        cur.execute("SELECT topic_id FROM subtopics WHERE subtopic_id=?", (currentTopicId,))
+        superTopics = cur.fetchall()
+        superTopics = [x[0] for x in superTopics]
+        superTopicNames = [getTopicFromId(x) + f" (id: {x})" for x in superTopics]
+        superTopicNames.sort(key=lambda x: (x.lower(), x))
+        print("Super topics:")
+        for superTopic in superTopicNames:
+            print("     " + superTopic)
+        # Print all sub topics
+        cur.execute("SELECT subtopic_id FROM subtopics WHERE topic_id=?", (currentTopicId,))
+        subTopics = cur.fetchall()
+        subTopics = [x[0] for x in subTopics]
+        subTopicNames = [getTopicFromId(x) + f" (id: {x})" for x in subTopics]
+        subTopicNames.sort(key=lambda x: (x.lower(), x))
+        print("Sub topics:")
+        for subTopic in subTopicNames:
+            print("     " + subTopic)
+        # Ask for the next topic
+        nextTopic = input("Next topic id: ")
+        if nextTopic == "":
+            break
+        try:
+            nextTopic = int(nextTopic)
+            # Test if the next topic id is in the database
+            cur.execute("SELECT topic FROM topics WHERE id=?", (nextTopic,))
+            topic = cur.fetchone()
+            if topic:
+                currentTopicId = nextTopic
+            else:
+                print("Invalid topic id")
+        except:
+            print("Invalid topic id")
+
 
 with open("technical_terms.txt", "r") as file:
     technicalTerms = file.read().split("\n")
 for term in technicalTerms:
     searchKeyword(term, 10)
 exportAllSearchPaths()
+navigateSubtopicNetwork()
