@@ -210,7 +210,7 @@ def navigateSubtopicNetwork():
 
 with open("technical_terms.txt", "r") as file:
     technicalTerms = file.read().split("\n")
-for term in technicalTerms:
-    searchKeyword(term, 10)
+#for term in technicalTerms:
+#    searchKeyword(term, 10)
 exportAllSearchPaths()
 navigateSubtopicNetwork()
